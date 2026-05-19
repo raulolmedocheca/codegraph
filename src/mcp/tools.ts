@@ -1315,11 +1315,46 @@ export class ToolHandler {
 
     for (const node of nodes) {
       const location = node.startLine ? `:${node.startLine}` : '';
-      // Compact: just name, kind, location
-      lines.push(`- ${node.name} (${node.kind}) - ${node.filePath}${location}`);
+      const tags = this.formatNodeListTags(node);
+      const tagSuffix = tags.length > 0 ? ` ${tags.join(' ')}` : '';
+      lines.push(`- ${node.name} (${node.kind})${tagSuffix} - ${node.filePath}${location}`);
     }
 
     return lines.join('\n');
+  }
+
+  /**
+   * Compact concurrency / DI markers shown next to a node in list views.
+   * Examples: `[@MainActor]`, `[throws]`, `[Sendable]`, `[final]`,
+   *           `[@Inject]`, `[nonisolated]`.
+   * Kept short — full details live in `formatNodeDetails`.
+   */
+  private formatNodeListTags(node: Node): string[] {
+    const tags: string[] = [];
+    if (node.isolation) {
+      switch (node.isolation.kind) {
+        case 'main_actor':
+          tags.push('[@MainActor]');
+          break;
+        case 'global_actor':
+          tags.push(node.isolation.actor ? `[@${node.isolation.actor}]` : '[global_actor]');
+          break;
+        case 'nonisolated':
+          tags.push('[nonisolated]');
+          break;
+        case 'nonisolated_unsafe':
+          tags.push('[nonisolated(unsafe)]');
+          break;
+        // 'actor' kind is implied by the node's `actor` kind label.
+      }
+    }
+    if (node.isSendable) tags.push(node.isSendableUnchecked ? '[@unchecked Sendable]' : '[Sendable]');
+    if (node.isThrowing) tags.push(node.thrownType ? `[throws(${node.thrownType})]` : '[throws]');
+    if (node.isRethrowing) tags.push('[rethrows]');
+    if (node.propertyWrappers && node.propertyWrappers.length > 0) {
+      for (const wrapper of node.propertyWrappers) tags.push(`[@${wrapper}]`);
+    }
+    return tags;
   }
 
   private formatImpact(symbol: string, impact: Subgraph): string {
@@ -1341,9 +1376,30 @@ export class ToolHandler {
 
     for (const [file, nodes] of byFile) {
       lines.push(`**${file}:**`);
-      // Compact: inline list
-      const nodeList = nodes.map(n => `${n.name}:${n.startLine}`).join(', ');
+      // Compact: inline list with concurrency markers when present.
+      const nodeList = nodes.map((n) => {
+        const tags = this.formatNodeListTags(n);
+        const tagSuffix = tags.length > 0 ? ` ${tags.join('')}` : '';
+        return `${n.name}:${n.startLine}${tagSuffix}`;
+      }).join(', ');
       lines.push(nodeList);
+      lines.push('');
+    }
+
+    // Summarise concurrency boundaries crossed in the impact set.
+    const isolated = Array.from(impact.nodes.values()).filter((n) => n.isolation);
+    if (isolated.length > 0) {
+      const byKind = new Map<string, number>();
+      for (const n of isolated) {
+        const key = n.isolation!.kind === 'global_actor' && n.isolation!.actor
+          ? `global_actor:${n.isolation!.actor}`
+          : n.isolation!.kind;
+        byKind.set(key, (byKind.get(key) ?? 0) + 1);
+      }
+      const summary = Array.from(byKind.entries())
+        .map(([k, c]) => `${k}=${c}`)
+        .join(', ');
+      lines.push(`**Concurrency context:** ${summary}`);
       lines.push('');
     }
 
@@ -1360,6 +1416,53 @@ export class ToolHandler {
 
     if (node.signature) {
       lines.push(`**Signature:** \`${node.signature}\``);
+    }
+
+    // Surface the concurrency / architecture metadata produced by the
+    // Swift extractor (and any other language that opts in to the
+    // modern-metadata hooks). Each line stays out of the way when the
+    // corresponding field is unset.
+    if (node.isActor) {
+      lines.push('**Actor:** yes');
+    }
+    if (node.isolation) {
+      const iso = node.isolation.kind === 'global_actor' && node.isolation.actor
+        ? `global_actor (${node.isolation.actor})`
+        : node.isolation.kind;
+      lines.push(`**Isolation:** ${iso}`);
+    }
+    if (node.isSendable) {
+      lines.push(`**Sendable:** ${node.isSendableUnchecked ? '@unchecked' : 'yes'}`);
+    }
+    if (node.isThrowing) {
+      lines.push(`**Throws:** ${node.thrownType ?? 'any'}`);
+    } else if (node.isRethrowing) {
+      lines.push('**Rethrows:** yes');
+    }
+    if (node.isOverride) lines.push('**Override:** yes');
+    if (node.isFinal) lines.push('**Final:** yes');
+    if (node.modifiers && node.modifiers.length > 0) {
+      lines.push(`**Modifiers:** ${node.modifiers.join(', ')}`);
+    }
+    if (node.propertyWrappers && node.propertyWrappers.length > 0) {
+      lines.push(`**Property wrappers:** ${node.propertyWrappers.map((w) => '@' + w).join(', ')}`);
+    }
+    if (node.inheritsFrom) {
+      lines.push(`**Inherits from:** ${node.inheritsFrom}`);
+    }
+    if (node.conformsTo && node.conformsTo.length > 0) {
+      lines.push(`**Conforms to:** ${node.conformsTo.join(', ')}`);
+    }
+    if (node.whereClause) {
+      lines.push(`**Where:** \`${node.whereClause}\``);
+    }
+    if (node.decorators && node.decorators.length > 0) {
+      // Display attributes with the @ prefix Swift readers expect.
+      const attrs = node.decorators.map((d) => (d.startsWith('@') ? d : `@${d}`));
+      lines.push(`**Attributes:** ${attrs.join(' ')}`);
+    }
+    if (node.typeParameters && node.typeParameters.length > 0) {
+      lines.push(`**Type parameters:** ${node.typeParameters.join(', ')}`);
     }
 
     // Only include docstring if it's short and useful

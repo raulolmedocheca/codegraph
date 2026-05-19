@@ -299,7 +299,7 @@ describe('Best-Candidate Resolution', () => {
 describe('Schema v2 Migration', () => {
   it.skipIf(!HAS_SQLITE)('should have correct current schema version', async () => {
     const { CURRENT_SCHEMA_VERSION } = await import('../src/db/migrations');
-    expect(CURRENT_SCHEMA_VERSION).toBe(4);
+    expect(CURRENT_SCHEMA_VERSION).toBe(5);
   });
 
   it.skipIf(!HAS_SQLITE)('should have migration for version 2', async () => {
@@ -404,9 +404,12 @@ describe('Database Layer Improvements', () => {
       });
     }
 
+    // Synthetic Swift stdlib nodes are co-registered; filter to the
+    // user-inserted nodes to test the inserted set.
     const allNodes = queries.getAllNodes();
-    expect(allNodes).toHaveLength(3);
-    expect(allNodes.map((n) => n.name).sort()).toEqual(['func0', 'func1', 'func2']);
+    const userNodes = allNodes.filter((n) => n.filePath !== '<swift-stdlib>');
+    expect(userNodes).toHaveLength(3);
+    expect(userNodes.map((n) => n.name).sort()).toEqual(['func0', 'func1', 'func2']);
 
     db.close();
   });

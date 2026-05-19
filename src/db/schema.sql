@@ -1,5 +1,5 @@
 -- CodeGraph SQLite Schema
--- Version 1
+-- Version 1 (with later migrations applied via src/db/migrations.ts; see CURRENT_SCHEMA_VERSION).
 
 -- Schema version tracking
 CREATE TABLE IF NOT EXISTS schema_versions (
@@ -37,7 +37,18 @@ CREATE TABLE IF NOT EXISTS nodes (
     is_abstract INTEGER DEFAULT 0,
     decorators TEXT, -- JSON array
     type_parameters TEXT, -- JSON array
-    updated_at INTEGER NOT NULL
+    updated_at INTEGER NOT NULL,
+    -- Swift-concurrency / modern-language metadata (added in migration v5).
+    -- High-frequency filters live in dedicated indexable columns; everything
+    -- else is serialized into metadata_json to keep the column count bounded.
+    is_actor INTEGER DEFAULT 0,
+    is_throwing INTEGER DEFAULT 0,
+    is_sendable INTEGER DEFAULT 0,
+    is_override INTEGER DEFAULT 0,
+    is_final INTEGER DEFAULT 0,
+    isolation_kind TEXT, -- 'main_actor' | 'global_actor' | 'actor' | 'nonisolated' | 'nonisolated_unsafe'
+    isolation_actor TEXT, -- custom global-actor name (when isolation_kind = 'global_actor')
+    metadata_json TEXT -- JSON: { modifiers, conformsTo, inheritsFrom, propertyWrappers, whereClause, thrownType, isRethrowing, isSendableUnchecked }
 );
 
 -- Edges: Relationships between nodes
@@ -77,6 +88,7 @@ CREATE TABLE IF NOT EXISTS unresolved_refs (
     candidates TEXT, -- JSON array
     file_path TEXT NOT NULL DEFAULT '',
     language TEXT NOT NULL DEFAULT 'unknown',
+    metadata TEXT, -- JSON object: call-site flags propagated to the resolved Edge (v5)
     FOREIGN KEY (from_node_id) REFERENCES nodes(id) ON DELETE CASCADE
 );
 
@@ -92,6 +104,11 @@ CREATE INDEX IF NOT EXISTS idx_nodes_file_path ON nodes(file_path);
 CREATE INDEX IF NOT EXISTS idx_nodes_language ON nodes(language);
 CREATE INDEX IF NOT EXISTS idx_nodes_file_line ON nodes(file_path, start_line);
 CREATE INDEX IF NOT EXISTS idx_nodes_lower_name ON nodes(lower(name));
+-- Swift-concurrency indexes (v5): partial indexes keep them small since most rows are 0/NULL.
+CREATE INDEX IF NOT EXISTS idx_nodes_actor ON nodes(is_actor) WHERE is_actor = 1;
+CREATE INDEX IF NOT EXISTS idx_nodes_sendable ON nodes(is_sendable) WHERE is_sendable = 1;
+CREATE INDEX IF NOT EXISTS idx_nodes_throwing ON nodes(is_throwing) WHERE is_throwing = 1;
+CREATE INDEX IF NOT EXISTS idx_nodes_isolation ON nodes(isolation_kind) WHERE isolation_kind IS NOT NULL;
 
 -- Full-text search index on node names, docstrings, and signatures
 CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(

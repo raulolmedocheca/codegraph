@@ -45,6 +45,31 @@ interface NodeRow {
   decorators: string | null;
   type_parameters: string | null;
   updated_at: number;
+  // Swift-concurrency / modern-language metadata (schema v5).
+  // Columns are nullable so legacy databases pre-migration still parse.
+  is_actor?: number | null;
+  is_throwing?: number | null;
+  is_sendable?: number | null;
+  is_override?: number | null;
+  is_final?: number | null;
+  isolation_kind?: string | null;
+  isolation_actor?: string | null;
+  metadata_json?: string | null;
+}
+
+/**
+ * Shape of the JSON blob persisted in `nodes.metadata_json`. Mirrors the
+ * subset of `Node` fields that don't have dedicated columns.
+ */
+interface NodeMetadataBlob {
+  modifiers?: string[];
+  conformsTo?: string[];
+  inheritsFrom?: string;
+  propertyWrappers?: string[];
+  whereClause?: string;
+  thrownType?: string;
+  isRethrowing?: boolean;
+  isSendableUnchecked?: boolean;
 }
 
 interface EdgeRow {
@@ -79,12 +104,44 @@ interface UnresolvedRefRow {
   candidates: string | null;
   file_path: string;
   language: string;
+  metadata?: string | null;
+}
+
+/**
+ * Map a raw DB row to the public `UnresolvedReference` shape.
+ * Centralised so every read site (by-name, batch, by-files, all) stays in sync.
+ */
+function rowToUnresolvedRef(row: UnresolvedRefRow): UnresolvedReference {
+  return {
+    fromNodeId: row.from_node_id,
+    referenceName: row.reference_name,
+    referenceKind: row.reference_kind as EdgeKind,
+    line: row.line,
+    column: row.col,
+    candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
+    filePath: row.file_path,
+    language: row.language as Language,
+    metadata: row.metadata
+      ? safeJsonParse<Record<string, unknown> | undefined>(row.metadata, undefined)
+      : undefined,
+  };
 }
 
 /**
  * Convert database row to Node object
  */
 function rowToNode(row: NodeRow): Node {
+  const blob = row.metadata_json
+    ? safeJsonParse<NodeMetadataBlob | undefined>(row.metadata_json, undefined)
+    : undefined;
+
+  const isolation: Node['isolation'] | undefined = row.isolation_kind
+    ? {
+        kind: row.isolation_kind as NonNullable<Node['isolation']>['kind'],
+        actor: row.isolation_actor ?? undefined,
+      }
+    : undefined;
+
   return {
     id: row.id,
     kind: row.kind as NodeKind,
@@ -105,8 +162,40 @@ function rowToNode(row: NodeRow): Node {
     isAbstract: row.is_abstract === 1,
     decorators: row.decorators ? safeJsonParse(row.decorators, undefined) : undefined,
     typeParameters: row.type_parameters ? safeJsonParse(row.type_parameters, undefined) : undefined,
+    // v5 fields
+    isActor: row.is_actor === 1 ? true : undefined,
+    isThrowing: row.is_throwing === 1 ? true : undefined,
+    isSendable: row.is_sendable === 1 ? true : undefined,
+    isOverride: row.is_override === 1 ? true : undefined,
+    isFinal: row.is_final === 1 ? true : undefined,
+    isolation,
+    modifiers: blob?.modifiers,
+    conformsTo: blob?.conformsTo,
+    inheritsFrom: blob?.inheritsFrom,
+    propertyWrappers: blob?.propertyWrappers,
+    whereClause: blob?.whereClause,
+    thrownType: blob?.thrownType,
+    isRethrowing: blob?.isRethrowing,
+    isSendableUnchecked: blob?.isSendableUnchecked,
     updatedAt: row.updated_at,
   };
+}
+
+/**
+ * Serialize the metadata blob fields of a Node for storage. Returns null
+ * when no metadata-blob field is set, so we don't bloat the DB with `{}`.
+ */
+function buildNodeMetadataBlob(node: Node): string | null {
+  const blob: NodeMetadataBlob = {};
+  if (node.modifiers?.length) blob.modifiers = node.modifiers;
+  if (node.conformsTo?.length) blob.conformsTo = node.conformsTo;
+  if (node.inheritsFrom) blob.inheritsFrom = node.inheritsFrom;
+  if (node.propertyWrappers?.length) blob.propertyWrappers = node.propertyWrappers;
+  if (node.whereClause) blob.whereClause = node.whereClause;
+  if (node.thrownType) blob.thrownType = node.thrownType;
+  if (node.isRethrowing) blob.isRethrowing = true;
+  if (node.isSendableUnchecked) blob.isSendableUnchecked = true;
+  return Object.keys(blob).length === 0 ? null : JSON.stringify(blob);
 }
 
 /**
@@ -201,13 +290,17 @@ export class QueryBuilder {
           start_line, end_line, start_column, end_column,
           docstring, signature, visibility,
           is_exported, is_async, is_static, is_abstract,
-          decorators, type_parameters, updated_at
+          decorators, type_parameters, updated_at,
+          is_actor, is_throwing, is_sendable, is_override, is_final,
+          isolation_kind, isolation_actor, metadata_json
         ) VALUES (
           @id, @kind, @name, @qualifiedName, @filePath, @language,
           @startLine, @endLine, @startColumn, @endColumn,
           @docstring, @signature, @visibility,
           @isExported, @isAsync, @isStatic, @isAbstract,
-          @decorators, @typeParameters, @updatedAt
+          @decorators, @typeParameters, @updatedAt,
+          @isActor, @isThrowing, @isSendable, @isOverride, @isFinal,
+          @isolationKind, @isolationActor, @metadataJson
         )
       `);
     }
@@ -246,6 +339,15 @@ export class QueryBuilder {
         decorators: node.decorators ? JSON.stringify(node.decorators) : null,
         typeParameters: node.typeParameters ? JSON.stringify(node.typeParameters) : null,
         updatedAt: node.updatedAt ?? Date.now(),
+        // v5: Swift-concurrency / modern-language metadata
+        isActor: node.isActor ? 1 : 0,
+        isThrowing: node.isThrowing ? 1 : 0,
+        isSendable: node.isSendable ? 1 : 0,
+        isOverride: node.isOverride ? 1 : 0,
+        isFinal: node.isFinal ? 1 : 0,
+        isolationKind: node.isolation?.kind ?? null,
+        isolationActor: node.isolation?.actor ?? null,
+        metadataJson: buildNodeMetadataBlob(node),
       });
     } catch (error) {
       throw error;
@@ -288,7 +390,15 @@ export class QueryBuilder {
           is_abstract = @isAbstract,
           decorators = @decorators,
           type_parameters = @typeParameters,
-          updated_at = @updatedAt
+          updated_at = @updatedAt,
+          is_actor = @isActor,
+          is_throwing = @isThrowing,
+          is_sendable = @isSendable,
+          is_override = @isOverride,
+          is_final = @isFinal,
+          isolation_kind = @isolationKind,
+          isolation_actor = @isolationActor,
+          metadata_json = @metadataJson
         WHERE id = @id
       `);
     }
@@ -323,6 +433,15 @@ export class QueryBuilder {
       decorators: node.decorators ? JSON.stringify(node.decorators) : null,
       typeParameters: node.typeParameters ? JSON.stringify(node.typeParameters) : null,
       updatedAt: node.updatedAt ?? Date.now(),
+      // v5: Swift-concurrency / modern-language metadata
+      isActor: node.isActor ? 1 : 0,
+      isThrowing: node.isThrowing ? 1 : 0,
+      isSendable: node.isSendable ? 1 : 0,
+      isOverride: node.isOverride ? 1 : 0,
+      isFinal: node.isFinal ? 1 : 0,
+      isolationKind: node.isolation?.kind ?? null,
+      isolationActor: node.isolation?.actor ?? null,
+      metadataJson: buildNodeMetadataBlob(node),
     });
   }
 
@@ -1152,8 +1271,8 @@ export class QueryBuilder {
   insertUnresolvedRef(ref: UnresolvedReference): void {
     if (!this.stmts.insertUnresolved) {
       this.stmts.insertUnresolved = this.db.prepare(`
-        INSERT INTO unresolved_refs (from_node_id, reference_name, reference_kind, line, col, candidates, file_path, language)
-        VALUES (@fromNodeId, @referenceName, @referenceKind, @line, @col, @candidates, @filePath, @language)
+        INSERT INTO unresolved_refs (from_node_id, reference_name, reference_kind, line, col, candidates, file_path, language, metadata)
+        VALUES (@fromNodeId, @referenceName, @referenceKind, @line, @col, @candidates, @filePath, @language, @metadata)
       `);
     }
 
@@ -1166,6 +1285,7 @@ export class QueryBuilder {
       candidates: ref.candidates ? JSON.stringify(ref.candidates) : null,
       filePath: ref.filePath ?? '',
       language: ref.language ?? 'unknown',
+      metadata: ref.metadata ? JSON.stringify(ref.metadata) : null,
     });
   }
 
@@ -1204,16 +1324,7 @@ export class QueryBuilder {
       );
     }
     const rows = this.stmts.getUnresolvedByName.all(name) as UnresolvedRefRow[];
-    return rows.map((row) => ({
-      fromNodeId: row.from_node_id,
-      referenceName: row.reference_name,
-      referenceKind: row.reference_kind as EdgeKind,
-      line: row.line,
-      column: row.col,
-      candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
-      filePath: row.file_path,
-      language: row.language as Language,
-    }));
+    return rows.map(rowToUnresolvedRef);
   }
 
   /**
@@ -1221,16 +1332,7 @@ export class QueryBuilder {
    */
   getUnresolvedReferences(): UnresolvedReference[] {
     const rows = this.db.prepare('SELECT * FROM unresolved_refs').all() as UnresolvedRefRow[];
-    return rows.map((row) => ({
-      fromNodeId: row.from_node_id,
-      referenceName: row.reference_name,
-      referenceKind: row.reference_kind as EdgeKind,
-      line: row.line,
-      column: row.col,
-      candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
-      filePath: row.file_path,
-      language: row.language as Language,
-    }));
+    return rows.map(rowToUnresolvedRef);
   }
 
   /**
@@ -1257,16 +1359,7 @@ export class QueryBuilder {
       );
     }
     const rows = this.stmts.getUnresolvedBatch.all(limit, offset) as UnresolvedRefRow[];
-    return rows.map((row) => ({
-      fromNodeId: row.from_node_id,
-      referenceName: row.reference_name,
-      referenceKind: row.reference_kind as EdgeKind,
-      line: row.line,
-      column: row.col,
-      candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
-      filePath: row.file_path,
-      language: row.language as Language,
-    }));
+    return rows.map(rowToUnresolvedRef);
   }
 
   /**
@@ -1303,16 +1396,7 @@ export class QueryBuilder {
       .prepare(`SELECT * FROM unresolved_refs WHERE file_path IN (${placeholders})`)
       .all(...filePaths) as UnresolvedRefRow[];
 
-    return rows.map((row) => ({
-      fromNodeId: row.from_node_id,
-      referenceName: row.reference_name,
-      referenceKind: row.reference_kind as EdgeKind,
-      line: row.line,
-      column: row.col,
-      candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
-      filePath: row.file_path,
-      language: row.language as Language,
-    }));
+    return rows.map(rowToUnresolvedRef);
   }
 
   /**

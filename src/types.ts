@@ -38,6 +38,13 @@ export const NODE_KINDS = [
   'export',
   'route',
   'component',
+  // Swift-specific kinds (also useful for other languages with similar constructs)
+  'actor',
+  'extension',
+  'initializer',
+  'deinitializer',
+  'subscript',
+  'operator',
 ] as const;
 
 export type NodeKind = (typeof NODE_KINDS)[number];
@@ -50,14 +57,19 @@ export type EdgeKind =
   | 'calls'           // Function/method calls another
   | 'imports'         // File imports from another
   | 'exports'         // File exports a symbol
-  | 'extends'         // Class/interface extends another
-  | 'implements'      // Class implements interface
+  | 'extends'         // Class/interface extends another (generic; resolver promotes to inherits_from/conforms_to)
+  | 'implements'      // Class implements interface (JVM-style)
   | 'references'      // Generic reference to another symbol
   | 'type_of'         // Variable/parameter has type
   | 'returns'         // Function returns type
   | 'instantiates'    // Creates instance of class
   | 'overrides'       // Method overrides parent method
-  | 'decorates';      // Decorator applied to symbol
+  | 'decorates'       // Decorator/attribute applied to symbol
+  // Swift / modern language additions
+  | 'conforms_to'     // Type conforms to protocol (Swift, Rust trait impl)
+  | 'inherits_from'   // Class inherits from base class
+  | 'wrapped_by'      // Property wrapped by a property wrapper (Swift @Inject, SwiftUI @State, etc.)
+  | 'isolated_to';    // Symbol isolated to a global actor (Swift @MainActor, @CustomActor)
 
 /**
  * Supported programming languages. See NODE_KINDS for why this is a
@@ -149,11 +161,90 @@ export interface Node {
   /** Whether symbol is abstract */
   isAbstract?: boolean;
 
-  /** Decorators/annotations applied */
+  /** Decorators/annotations/attributes applied (raw text e.g. "@MainActor", "@available(iOS 17, *)") */
   decorators?: string[];
 
   /** Generic type parameters */
   typeParameters?: string[];
+
+  // ---------------------------------------------------------------------------
+  // Language-modifier metadata (populated mainly by Swift; safe to use elsewhere)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Raw modifier keywords on the declaration.
+   * Examples (Swift): "final", "open", "override", "convenience", "required",
+   * "lazy", "weak", "unowned", "unowned(unsafe)", "dynamic", "distributed",
+   * "indirect", "nonisolated", "nonisolated(unsafe)", "borrowing",
+   * "consuming", "inout", "mutating", "nonmutating".
+   */
+  modifiers?: string[];
+
+  /** True if this symbol is an `actor` declaration (Swift). */
+  isActor?: boolean;
+
+  /** True if this declaration carries the `override` keyword (Swift, Kotlin, C#). */
+  isOverride?: boolean;
+
+  /** True if this declaration carries the `final` keyword. */
+  isFinal?: boolean;
+
+  /** True if a function/method/initializer is `throws`. */
+  isThrowing?: boolean;
+
+  /** True if a function/method is `rethrows` (Swift). */
+  isRethrowing?: boolean;
+
+  /**
+   * Typed-throws error type (Swift 6: `throws(SomeError)`).
+   * Undefined for untyped `throws` or `rethrows`.
+   */
+  thrownType?: string;
+
+  /** True if this type conforms to `Sendable` (Swift). */
+  isSendable?: boolean;
+
+  /** True if the conformance is `@unchecked Sendable`. */
+  isSendableUnchecked?: boolean;
+
+  /**
+   * Actor / global-actor isolation context.
+   * - `main_actor`           → `@MainActor`
+   * - `global_actor`         → `@SomeCustomActor` (custom global actor; `actor` carries its name)
+   * - `actor`                → method/property of an `actor` type (isolated to that actor instance)
+   * - `nonisolated`          → `nonisolated`
+   * - `nonisolated_unsafe`   → `nonisolated(unsafe)`
+   */
+  isolation?: {
+    kind: 'main_actor' | 'global_actor' | 'actor' | 'nonisolated' | 'nonisolated_unsafe';
+    /** Name of the global/custom actor (when `kind` is `'global_actor'`). */
+    actor?: string;
+  };
+
+  /**
+   * Raw conformance list as written in the inheritance clause (Swift, Rust).
+   * Edges of kind `conforms_to` are also emitted to the resolved protocols.
+   */
+  conformsTo?: string[];
+
+  /**
+   * Raw superclass name (Swift class inheritance).
+   * Edge of kind `inherits_from` is also emitted to the resolved class.
+   */
+  inheritsFrom?: string;
+
+  /**
+   * Property wrapper names applied to a property (Swift), without the `@` prefix.
+   * Examples: ["Inject"], ["LazyInject"], ["State"], ["Published", "MainActor"].
+   * Edges of kind `wrapped_by` are also emitted to the resolved wrapper types.
+   */
+  propertyWrappers?: string[];
+
+  /**
+   * Raw text of a `where` clause on a generic declaration or extension (Swift).
+   * Example: "T: Sendable, T.Element == Int".
+   */
+  whereClause?: string;
 
   /** When the node was last updated */
   updatedAt: number;
@@ -161,6 +252,26 @@ export interface Node {
 
 /**
  * An edge representing a relationship between two nodes
+ */
+/**
+ * Documented shapes for `Edge.metadata`. The field is intentionally
+ * `Record<string, unknown>` for forward-compatibility; this type union
+ * captures the known/extracted shapes.
+ *
+ * For `kind: 'calls'` (call sites):
+ *   - `isAwait?: boolean`           → call wrapped in `await` (Swift, JS/TS, Python)
+ *   - `tryKind?: 'plain'|'optional'|'forced'` → Swift `try`, `try?`, `try!`
+ *   - `spawnsTask?: boolean`        → call to `Task { }`, `Task.detached`, `TaskGroup`
+ *   - `asyncIteration?: boolean`    → call inside a `for await` loop
+ *   - `isolationBoundary?: boolean` → call to `MainActor.run`, `assumeIsolated`,
+ *                                     `withCheckedContinuation`, etc.
+ *
+ * For `kind: 'conforms_to'`:
+ *   - `conditional?: boolean`       → extension Foo: Bar where ...
+ *   - `where?: string`              → raw where-clause text
+ *
+ * For `kind: 'decorates'`:
+ *   - `category?: 'isolation' | 'di' | 'swiftui' | 'objc' | 'availability' | 'other'`
  */
 export interface Edge {
   /** Source node ID */
@@ -172,7 +283,7 @@ export interface Edge {
   /** Type of relationship */
   kind: EdgeKind;
 
-  /** Additional context about the relationship */
+  /** Additional context about the relationship (see comment above for shapes). */
   metadata?: Record<string, unknown>;
 
   /** Line number where relationship occurs (e.g., call site) */
@@ -286,6 +397,13 @@ export interface UnresolvedReference {
 
   /** Possible qualified names it might resolve to */
   candidates?: string[];
+
+  /**
+   * Optional metadata to attach to the resolved Edge.
+   * Used to propagate call-site flags such as `isAwait`, `tryKind`, etc.
+   * (See `Edge.metadata` documentation above for known shapes.)
+   */
+  metadata?: Record<string, unknown>;
 }
 
 // =============================================================================

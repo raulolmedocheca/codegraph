@@ -9,6 +9,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { SchemaVersion } from '../types';
 import { runMigrations, getCurrentVersion, CURRENT_SCHEMA_VERSION } from './migrations';
+import { ensureSwiftBuiltins } from './swift-builtins';
 
 export { SqliteDatabase, SqliteBackend, WASM_FALLBACK_FIX_RECIPE } from './sqlite-adapter';
 
@@ -64,6 +65,10 @@ export class DatabaseConnection {
       ).run(CURRENT_SCHEMA_VERSION, Date.now(), 'Initial schema includes all migrations');
     }
 
+    // Register synthetic nodes for Swift stdlib protocols so Sendable/etc.
+    // conformances from user code resolve to a real target.
+    ensureSwiftBuiltins(db);
+
     return new DatabaseConnection(db, dbPath, backend);
   }
 
@@ -96,6 +101,11 @@ export class DatabaseConnection {
     if (currentVersion < CURRENT_SCHEMA_VERSION) {
       runMigrations(db, currentVersion);
     }
+
+    // Ensure synthetic Swift stdlib nodes exist on every open — they
+    // may have been wiped by a database reset/rebuild without the user
+    // re-running `initialize()`.
+    ensureSwiftBuiltins(db);
 
     return conn;
   }

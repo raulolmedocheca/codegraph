@@ -9,7 +9,7 @@ import { SqliteDatabase } from './sqlite-adapter';
 /**
  * Current schema version
  */
-export const CURRENT_SCHEMA_VERSION = 4;
+export const CURRENT_SCHEMA_VERSION = 5;
 
 /**
  * Migration definition
@@ -62,6 +62,28 @@ const migrations: Migration[] = [
       db.exec(`
         DROP INDEX IF EXISTS idx_edges_source;
         DROP INDEX IF EXISTS idx_edges_target;
+      `);
+    },
+  },
+  {
+    version: 5,
+    description:
+      'Add Swift-concurrency / modern-language metadata: isolation, actor/throws/sendable/override/final flags, metadata_json blob',
+    up: (db) => {
+      db.exec(`
+        ALTER TABLE nodes ADD COLUMN is_actor INTEGER DEFAULT 0;
+        ALTER TABLE nodes ADD COLUMN is_throwing INTEGER DEFAULT 0;
+        ALTER TABLE nodes ADD COLUMN is_sendable INTEGER DEFAULT 0;
+        ALTER TABLE nodes ADD COLUMN is_override INTEGER DEFAULT 0;
+        ALTER TABLE nodes ADD COLUMN is_final INTEGER DEFAULT 0;
+        ALTER TABLE nodes ADD COLUMN isolation_kind TEXT;
+        ALTER TABLE nodes ADD COLUMN isolation_actor TEXT;
+        ALTER TABLE nodes ADD COLUMN metadata_json TEXT;
+        ALTER TABLE unresolved_refs ADD COLUMN metadata TEXT;
+        CREATE INDEX IF NOT EXISTS idx_nodes_actor ON nodes(is_actor) WHERE is_actor = 1;
+        CREATE INDEX IF NOT EXISTS idx_nodes_sendable ON nodes(is_sendable) WHERE is_sendable = 1;
+        CREATE INDEX IF NOT EXISTS idx_nodes_throwing ON nodes(is_throwing) WHERE is_throwing = 1;
+        CREATE INDEX IF NOT EXISTS idx_nodes_isolation ON nodes(isolation_kind) WHERE isolation_kind IS NOT NULL;
       `);
     },
   },

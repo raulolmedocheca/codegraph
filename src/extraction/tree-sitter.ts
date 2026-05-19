@@ -274,7 +274,8 @@ export class TreeSitterExtractor {
     }
     // Check for class declarations
     else if (this.extractor.classTypes.includes(nodeType)) {
-      // Some languages reuse class_declaration for structs/enums (e.g. Swift)
+      // Some languages reuse class_declaration for structs/enums/actors/extensions
+      // (e.g. Swift discriminates via a `declaration_kind` field).
       const classification = this.extractor.classifyClassNode?.(node) ?? 'class';
       if (classification === 'struct') {
         this.extractStruct(node);
@@ -284,6 +285,10 @@ export class TreeSitterExtractor {
         this.extractInterface(node);
       } else if (classification === 'trait') {
         this.extractClass(node, 'trait');
+      } else if (classification === 'actor') {
+        this.extractClass(node, 'actor');
+      } else if (classification === 'extension') {
+        this.extractExtension(node);
       } else {
         this.extractClass(node);
       }
@@ -484,7 +489,8 @@ export class TreeSitterExtractor {
 
   /**
    * Check if the current node stack indicates we are inside a class-like node
-   * (class, struct, interface, trait). File nodes do not count as class-like.
+   * (class, struct, interface, trait, protocol, actor, extension, enum, module).
+   * File nodes do not count as class-like.
    */
   private isInsideClassLikeNode(): boolean {
     if (this.nodeStack.length === 0) return false;
@@ -497,9 +503,80 @@ export class TreeSitterExtractor {
       parentNode.kind === 'struct' ||
       parentNode.kind === 'interface' ||
       parentNode.kind === 'trait' ||
+      parentNode.kind === 'protocol' ||
+      parentNode.kind === 'actor' ||
+      parentNode.kind === 'extension' ||
       parentNode.kind === 'enum' ||
       parentNode.kind === 'module'
     );
+  }
+
+  /**
+   * Pull modern-language metadata via the optional LanguageExtractor hooks
+   * (`getModifiers`, `getIsolation`, `isThrowing`, `isRethrowing`,
+   * `getThrownType`, `isOverride`, `isFinal`). Returns only the keys that
+   * the language reports — leaves the rest unset so the JSON metadata blob
+   * stays small.
+   *
+   * Used by every symbol-creating extractor (function, method, class,
+   * struct, enum, interface, property, field). Languages that don't
+   * implement these hooks contribute nothing here — the returned partial
+   * is `{}`.
+   */
+  private gatherModernMetadata(node: SyntaxNode): Partial<Node> {
+    if (!this.extractor) return {};
+    const ex = this.extractor;
+    const result: Partial<Node> = {};
+
+    const modifiers = ex.getModifiers?.(node, this.source);
+    if (modifiers && modifiers.length > 0) result.modifiers = modifiers;
+
+    const isolation = ex.getIsolation?.(node, this.source);
+    if (isolation) result.isolation = isolation;
+
+    if (ex.isThrowing?.(node)) result.isThrowing = true;
+    if (ex.isRethrowing?.(node)) result.isRethrowing = true;
+    const thrownType = ex.getThrownType?.(node, this.source);
+    if (thrownType) result.thrownType = thrownType;
+
+    if (ex.isOverride?.(node)) result.isOverride = true;
+    if (ex.isFinal?.(node)) result.isFinal = true;
+
+    return result;
+  }
+
+  /**
+   * Emit an `isolated_to` UnresolvedReference for a symbol annotated with
+   * a custom global actor (Swift `@SomeActor`). The actor name is
+   * resolved by the standard import/name-matching pipeline.
+   */
+  private emitIsolatedToEdge(nodeId: string, isolation: Node['isolation'], at: SyntaxNode): void {
+    if (!isolation || isolation.kind !== 'global_actor' || !isolation.actor) return;
+    this.unresolvedReferences.push({
+      fromNodeId: nodeId,
+      referenceName: isolation.actor,
+      referenceKind: 'isolated_to',
+      line: at.startPosition.row + 1,
+      column: at.startPosition.column,
+    });
+  }
+
+  /**
+   * Emit `wrapped_by` UnresolvedReferences for each property wrapper on
+   * a property. The wrapper names are resolved to their declarations
+   * (e.g. `Inject`, `LazyInject`, `Published`) by the standard pipeline.
+   */
+  private emitPropertyWrapperEdges(nodeId: string, wrappers: string[] | undefined, at: SyntaxNode): void {
+    if (!wrappers || wrappers.length === 0) return;
+    for (const wrapper of wrappers) {
+      this.unresolvedReferences.push({
+        fromNodeId: nodeId,
+        referenceName: wrapper,
+        referenceKind: 'wrapped_by',
+        line: at.startPosition.row + 1,
+        column: at.startPosition.column,
+      });
+    }
   }
 
   /**
@@ -551,6 +628,7 @@ export class TreeSitterExtractor {
     const isExported = this.extractor.isExported?.(node, this.source);
     const isAsync = this.extractor.isAsync?.(node);
     const isStatic = this.extractor.isStatic?.(node);
+    const modernMeta = this.gatherModernMetadata(node);
 
     const funcNode = this.createNode('function', name, node, {
       docstring,
@@ -559,6 +637,7 @@ export class TreeSitterExtractor {
       isExported,
       isAsync,
       isStatic,
+      ...modernMeta,
     });
     if (!funcNode) return;
 
@@ -567,8 +646,11 @@ export class TreeSitterExtractor {
 
     // Extract decorators applied to the function (rare in JS/TS but
     // present in Python `@decorator def f():` and Java/Kotlin
-    // annotations on free functions).
+    // annotations on free functions; Swift `@MainActor func`).
     this.extractDecoratorsFor(node, funcNode.id);
+
+    // Emit isolated_to edge if the function is annotated with a custom global actor.
+    this.emitIsolatedToEdge(funcNode.id, modernMeta.isolation, node);
 
     // Push to stack and visit body
     this.nodeStack.push(funcNode.id);
@@ -590,19 +672,48 @@ export class TreeSitterExtractor {
     const docstring = getPrecedingDocstring(node, this.source);
     const visibility = this.extractor.getVisibility?.(node);
     const isExported = this.extractor.isExported?.(node, this.source);
+    const signature = this.extractor.getSignature?.(node, this.source);
+    const modernMeta = this.gatherModernMetadata(node);
+    const inheritance = this.extractor.getInheritanceClause?.(node, this.source);
+    const isSendableInConforms = inheritance?.conforms.some((c) => c === 'Sendable' || c === '@unchecked Sendable');
+    const isSendableInherits = inheritance?.inherits === 'Sendable' || inheritance?.inherits === '@unchecked Sendable';
+    const isSendable = (isSendableInConforms || isSendableInherits) || undefined;
+    const isSendableUnchecked = (
+      inheritance?.conforms.some(
+        (c) => c === '@unchecked Sendable' || c === 'unchecked Sendable'
+      ) ||
+      inheritance?.inherits === '@unchecked Sendable' ||
+      inheritance?.inherits === 'unchecked Sendable'
+    ) || undefined;
+    // Default isolation for actor types when no explicit annotation: `{ kind: 'actor' }`.
+    const isolation = modernMeta.isolation
+      ?? (kind === 'actor' ? ({ kind: 'actor' } as Node['isolation']) : undefined);
 
     const classNode = this.createNode(kind, name, node, {
       docstring,
+      signature,
       visibility,
       isExported,
+      ...modernMeta,
+      isActor: kind === 'actor' ? true : undefined,
+      isSendable,
+      isSendableUnchecked,
+      isolation,
+      conformsTo: inheritance?.conforms?.length ? inheritance.conforms : undefined,
+      inheritsFrom: inheritance?.inherits,
+      whereClause: inheritance?.whereClause,
     });
     if (!classNode) return;
 
-    // Extract extends/implements
+    // Extract extends/implements (Swift uses inheritance_specifier; resolver
+    // promotes 'extends' to 'inherits_from' or 'conforms_to' based on target kind).
     this.extractInheritance(node, classNode.id);
 
     // Extract decorators applied to the class (`@Foo class X {}`).
     this.extractDecoratorsFor(node, classNode.id);
+
+    // Emit isolated_to edge for global-actor isolation (e.g. `@CustomActor class Foo`).
+    this.emitIsolatedToEdge(classNode.id, isolation, node);
 
     // Push to stack and visit body
     this.nodeStack.push(classNode.id);
@@ -616,6 +727,78 @@ export class TreeSitterExtractor {
       if (child) {
         this.visitNode(child);
       }
+    }
+    this.nodeStack.pop();
+  }
+
+  /**
+   * Extract a Swift-style extension (`extension Foo: Bar where T: Baz`).
+   *
+   * The node's `name` field holds the type being extended; the
+   * `inheritance_specifier` children hold conformances. We create an
+   * `'extension'` node whose `.name` is the extended type, emit an
+   * `extends` UnresolvedReference binding it to the extended type, and
+   * let `extractInheritance` produce conformance edges for the rest.
+   */
+  private extractExtension(node: SyntaxNode): void {
+    if (!this.extractor) return;
+
+    const name = extractName(node, this.source, this.extractor);
+    const docstring = getPrecedingDocstring(node, this.source);
+    const visibility = this.extractor.getVisibility?.(node);
+    const signature = this.extractor.getSignature?.(node, this.source);
+    const modernMeta = this.gatherModernMetadata(node);
+    const inheritance = this.extractor.getInheritanceClause?.(node, this.source);
+    const isSendableInConforms = inheritance?.conforms.some((c) => c === 'Sendable' || c === '@unchecked Sendable');
+    const isSendableInherits = inheritance?.inherits === 'Sendable' || inheritance?.inherits === '@unchecked Sendable';
+    const isSendable = (isSendableInConforms || isSendableInherits) || undefined;
+    const isSendableUnchecked = (
+      inheritance?.conforms.some(
+        (c) => c === '@unchecked Sendable' || c === 'unchecked Sendable'
+      ) ||
+      inheritance?.inherits === '@unchecked Sendable' ||
+      inheritance?.inherits === 'unchecked Sendable'
+    ) || undefined;
+
+    const extensionNode = this.createNode('extension', name, node, {
+      docstring,
+      signature,
+      visibility,
+      ...modernMeta,
+      isSendable,
+      isSendableUnchecked,
+      conformsTo: inheritance?.conforms?.length ? inheritance.conforms : undefined,
+      whereClause: inheritance?.whereClause,
+    });
+    if (!extensionNode) return;
+
+    // Bind the extension to the type it extends.
+    if (name) {
+      this.unresolvedReferences.push({
+        fromNodeId: extensionNode.id,
+        referenceName: name,
+        referenceKind: 'extends',
+        line: node.startPosition.row + 1,
+        column: node.startPosition.column,
+      });
+    }
+
+    // Conformances → emitted by extractInheritance via inheritance_specifier.
+    this.extractInheritance(node, extensionNode.id);
+
+    // Attributes on the extension (`@available(...) extension Foo: Bar`).
+    this.extractDecoratorsFor(node, extensionNode.id);
+
+    this.emitIsolatedToEdge(extensionNode.id, modernMeta.isolation, node);
+
+    // Push to stack and visit body.
+    this.nodeStack.push(extensionNode.id);
+    let body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
+      ?? getChildByField(node, this.extractor.bodyField);
+    if (!body) body = node;
+    for (let i = 0; i < body.namedChildCount; i++) {
+      const child = body.namedChild(i);
+      if (child) this.visitNode(child);
     }
     this.nodeStack.pop();
   }
@@ -662,12 +845,14 @@ export class TreeSitterExtractor {
     const visibility = this.extractor.getVisibility?.(node);
     const isAsync = this.extractor.isAsync?.(node);
     const isStatic = this.extractor.isStatic?.(node);
+    const modernMeta = this.gatherModernMetadata(node);
     const extraProps: Partial<Node> = {
       docstring,
       signature,
       visibility,
       isAsync,
       isStatic,
+      ...modernMeta,
     };
     if (receiverType) {
       extraProps.qualifiedName = `${receiverType}::${name}`;
@@ -697,8 +882,11 @@ export class TreeSitterExtractor {
     // Extract type annotations (parameter types and return type)
     this.extractTypeAnnotations(node, methodNode.id);
 
-    // Extract decorators (`@Get('/list') list() {}`).
+    // Extract decorators (`@Get('/list') list() {}` / `@MainActor func`).
     this.extractDecoratorsFor(node, methodNode.id);
+
+    // Emit isolated_to edge for global-actor isolation.
+    this.emitIsolatedToEdge(methodNode.id, modernMeta.isolation, node);
 
     // Push to stack and visit body
     this.nodeStack.push(methodNode.id);
@@ -719,17 +907,36 @@ export class TreeSitterExtractor {
     const name = extractName(node, this.source, this.extractor);
     const docstring = getPrecedingDocstring(node, this.source);
     const isExported = this.extractor.isExported?.(node, this.source);
+    const signature = this.extractor.getSignature?.(node, this.source);
+    const visibility = this.extractor.getVisibility?.(node);
+    const modernMeta = this.gatherModernMetadata(node);
+    const inheritance = this.extractor.getInheritanceClause?.(node, this.source);
+    // For Swift `protocol Foo: Sendable`, Sendable refinement is captured here too.
+    const isSendableInConforms = inheritance?.conforms.some((c) => c === 'Sendable' || c === '@unchecked Sendable');
+    const isSendableInherits = inheritance?.inherits === 'Sendable' || inheritance?.inherits === '@unchecked Sendable';
+    const isSendable = (isSendableInConforms || isSendableInherits) || undefined;
 
     const kind: NodeKind = this.extractor.interfaceKind ?? 'interface';
 
     const interfaceNode = this.createNode(kind, name, node, {
       docstring,
+      signature,
+      visibility,
       isExported,
+      ...modernMeta,
+      isSendable,
+      conformsTo: inheritance?.conforms?.length ? inheritance.conforms : undefined,
+      whereClause: inheritance?.whereClause,
     });
     if (!interfaceNode) return;
 
-    // Extract extends (interface inheritance)
+    // Extract extends (interface inheritance / protocol refinements)
     this.extractInheritance(node, interfaceNode.id);
+
+    // Attributes on the protocol (`@available(...) protocol Foo`).
+    this.extractDecoratorsFor(node, interfaceNode.id);
+
+    this.emitIsolatedToEdge(interfaceNode.id, modernMeta.isolation, node);
 
     // Visit body children for interface methods and nested types
     this.nodeStack.push(interfaceNode.id);
@@ -759,16 +966,40 @@ export class TreeSitterExtractor {
     const docstring = getPrecedingDocstring(node, this.source);
     const visibility = this.extractor.getVisibility?.(node);
     const isExported = this.extractor.isExported?.(node, this.source);
+    const signature = this.extractor.getSignature?.(node, this.source);
+    const modernMeta = this.gatherModernMetadata(node);
+    const inheritance = this.extractor.getInheritanceClause?.(node, this.source);
+    const isSendableInConforms = inheritance?.conforms.some((c) => c === 'Sendable' || c === '@unchecked Sendable');
+    const isSendableInherits = inheritance?.inherits === 'Sendable' || inheritance?.inherits === '@unchecked Sendable';
+    const isSendable = (isSendableInConforms || isSendableInherits) || undefined;
+    const isSendableUnchecked = (
+      inheritance?.conforms.some(
+        (c) => c === '@unchecked Sendable' || c === 'unchecked Sendable'
+      ) ||
+      inheritance?.inherits === '@unchecked Sendable' ||
+      inheritance?.inherits === 'unchecked Sendable'
+    ) || undefined;
 
     const structNode = this.createNode('struct', name, node, {
       docstring,
+      signature,
       visibility,
       isExported,
+      ...modernMeta,
+      isSendable,
+      isSendableUnchecked,
+      conformsTo: inheritance?.conforms?.length ? inheritance.conforms : undefined,
+      whereClause: inheritance?.whereClause,
     });
     if (!structNode) return;
 
     // Extract inheritance (e.g. Swift: struct HTTPMethod: RawRepresentable)
     this.extractInheritance(node, structNode.id);
+
+    // Attributes on the struct (`@frozen struct Foo`, `@dynamicMemberLookup struct Bar`).
+    this.extractDecoratorsFor(node, structNode.id);
+
+    this.emitIsolatedToEdge(structNode.id, modernMeta.isolation, node);
 
     // Push to stack for field extraction
     this.nodeStack.push(structNode.id);
@@ -796,16 +1027,32 @@ export class TreeSitterExtractor {
     const docstring = getPrecedingDocstring(node, this.source);
     const visibility = this.extractor.getVisibility?.(node);
     const isExported = this.extractor.isExported?.(node, this.source);
+    const signature = this.extractor.getSignature?.(node, this.source);
+    const modernMeta = this.gatherModernMetadata(node);
+    const inheritance = this.extractor.getInheritanceClause?.(node, this.source);
+    const isSendableInConforms = inheritance?.conforms.some((c) => c === 'Sendable' || c === '@unchecked Sendable');
+    const isSendableInherits = inheritance?.inherits === 'Sendable' || inheritance?.inherits === '@unchecked Sendable';
+    const isSendable = (isSendableInConforms || isSendableInherits) || undefined;
 
     const enumNode = this.createNode('enum', name, node, {
       docstring,
+      signature,
       visibility,
       isExported,
+      ...modernMeta,
+      isSendable,
+      conformsTo: inheritance?.conforms?.length ? inheritance.conforms : undefined,
+      whereClause: inheritance?.whereClause,
     });
     if (!enumNode) return;
 
     // Extract inheritance (e.g. Swift: enum AFError: Error)
     this.extractInheritance(node, enumNode.id);
+
+    // Attributes on the enum (`@frozen enum Foo`).
+    this.extractDecoratorsFor(node, enumNode.id);
+
+    this.emitIsolatedToEdge(enumNode.id, modernMeta.isolation, node);
 
     // Push to stack and visit body children (enum members, nested types, methods)
     this.nodeStack.push(enumNode.id);
@@ -862,6 +1109,8 @@ export class TreeSitterExtractor {
     const docstring = getPrecedingDocstring(node, this.source);
     const visibility = this.extractor.getVisibility?.(node);
     const isStatic = this.extractor.isStatic?.(node) ?? false;
+    const modernMeta = this.gatherModernMetadata(node);
+    const propertyWrappers = this.extractor.getPropertyWrappers?.(node, this.source);
 
     // Property name is a direct identifier child
     const nameNode = getChildByField(node, 'name')
@@ -884,12 +1133,16 @@ export class TreeSitterExtractor {
       signature,
       visibility,
       isStatic,
+      ...modernMeta,
+      propertyWrappers: propertyWrappers?.length ? propertyWrappers : undefined,
     });
 
     // `@Inject() private svc: Foo` and similar — capture the
     // decorator->target relationship for class properties too.
     if (propNode) {
       this.extractDecoratorsFor(node, propNode.id);
+      this.emitPropertyWrapperEdges(propNode.id, propertyWrappers, node);
+      this.emitIsolatedToEdge(propNode.id, modernMeta.isolation, node);
     }
   }
 
@@ -903,6 +1156,13 @@ export class TreeSitterExtractor {
     const docstring = getPrecedingDocstring(node, this.source);
     const visibility = this.extractor.getVisibility?.(node);
     const isStatic = this.extractor.isStatic?.(node) ?? false;
+    // Modifiers / isolation / property wrappers attach to the OUTER
+    // field_declaration node; we apply them to every declared field.
+    const modernMeta = this.gatherModernMetadata(node);
+    const propertyWrappers = this.extractor.getPropertyWrappers?.(node, this.source);
+    const wrapperPartial: Partial<Node> = propertyWrappers && propertyWrappers.length > 0
+      ? { propertyWrappers }
+      : {};
 
     // Java field_declaration: "private final String name = value;" → variable_declarator(s) are direct children
     // C# field_declaration: wraps in variable_declaration → variable_declarator(s)
@@ -935,12 +1195,18 @@ export class TreeSitterExtractor {
           if (!nameNode) continue;
           const name = getNodeText(nameNode, this.source);
           const signature = typeText ? `${typeText} $${name}` : `$${name}`;
-          this.createNode('field', name, elem, {
+          const fieldNode = this.createNode('field', name, elem, {
             docstring,
             signature,
             visibility,
             isStatic,
+            ...modernMeta,
+            ...wrapperPartial,
           });
+          if (fieldNode) {
+            this.emitPropertyWrapperEdges(fieldNode.id, propertyWrappers, node);
+            this.emitIsolatedToEdge(fieldNode.id, modernMeta.isolation, node);
+          }
         }
         return;
       }
@@ -969,10 +1235,16 @@ export class TreeSitterExtractor {
           signature,
           visibility,
           isStatic,
+          ...modernMeta,
+          ...wrapperPartial,
         });
         // Java/Kotlin annotations / TS field decorators sit on the
         // outer field_declaration, not on the individual declarator.
-        if (fieldNode) this.extractDecoratorsFor(node, fieldNode.id);
+        if (fieldNode) {
+          this.extractDecoratorsFor(node, fieldNode.id);
+          this.emitPropertyWrapperEdges(fieldNode.id, propertyWrappers, node);
+          this.emitIsolatedToEdge(fieldNode.id, modernMeta.isolation, node);
+        }
       }
     } else {
       // Fallback: try to find an identifier child directly
@@ -980,11 +1252,17 @@ export class TreeSitterExtractor {
         || node.namedChildren.find(c => c.type === 'identifier');
       if (nameNode) {
         const name = getNodeText(nameNode, this.source);
-        this.createNode('field', name, node, {
+        const fieldNode = this.createNode('field', name, node, {
           docstring,
           visibility,
           isStatic,
+          ...modernMeta,
+          ...wrapperPartial,
         });
+        if (fieldNode) {
+          this.emitPropertyWrapperEdges(fieldNode.id, propertyWrappers, node);
+          this.emitIsolatedToEdge(fieldNode.id, modernMeta.isolation, node);
+        }
       }
     }
   }
@@ -1444,14 +1722,114 @@ export class TreeSitterExtractor {
     }
 
     if (calleeName) {
+      const callMetadata = this.detectCallSiteFlags(node, calleeName);
       this.unresolvedReferences.push({
         fromNodeId: callerId,
         referenceName: calleeName,
         referenceKind: 'calls',
         line: node.startPosition.row + 1,
         column: node.startPosition.column,
+        ...(callMetadata && Object.keys(callMetadata).length > 0
+          ? { metadata: callMetadata }
+          : {}),
       });
     }
+  }
+
+  /**
+   * Inspect a `call_expression`'s ancestors for Swift suspension/error
+   * markers and recognize a handful of well-known stdlib spawners. Returns
+   * a metadata object attached to the resulting `calls` edge so the agent
+   * can ask "which call sites await?" or "what spawns Tasks here?".
+   *
+   * Marker types looked up:
+   *   - `await_expression` (Swift, JS/TS, Python)  → `isAwait: true`
+   *   - `try_expression` (Swift)                   → `tryKind: 'plain'`
+   *   - `try_operator` child with `?` / `!` token  → `tryKind: 'optional' | 'forced'`
+   *   - For-loop with `await`                       → `asyncIteration: true`
+   *
+   * Spawners recognized by callee name:
+   *   - `Task`, `Task.detached`, `Task.init`
+   *   - `withTaskGroup`, `withThrowingTaskGroup`, `withDiscardingTaskGroup`
+   *   → `spawnsTask: true`
+   *
+   * Isolation boundaries:
+   *   - `MainActor.run`, `assumeIsolated`,
+   *     `withCheckedContinuation`, `withCheckedThrowingContinuation`,
+   *     `withUnsafeContinuation`, `withUnsafeThrowingContinuation`
+   *   → `isolationBoundary: true`
+   */
+  private detectCallSiteFlags(node: SyntaxNode, calleeName: string): Record<string, unknown> | undefined {
+    const flags: Record<string, unknown> = {};
+
+    // Walk up at most ~3 levels to find await / try / for-await wrappers.
+    let parent: SyntaxNode | null = node.parent;
+    let depth = 0;
+    while (parent && depth < 4) {
+      if (parent.type === 'await_expression') {
+        flags.isAwait = true;
+      } else if (parent.type === 'try_expression') {
+        // Default kind is "plain"; check children for `?` or `!` operator suffix.
+        let tryKind: 'plain' | 'optional' | 'forced' = 'plain';
+        for (let i = 0; i < parent.namedChildCount; i++) {
+          const child = parent.namedChild(i);
+          if (!child) continue;
+          if (child.type === 'try_operator' || child.type === 'try_op') {
+            const txt = child.text;
+            if (txt.includes('?')) tryKind = 'optional';
+            else if (txt.includes('!')) tryKind = 'forced';
+          }
+        }
+        flags.tryKind = tryKind;
+      } else if (parent.type === 'for_statement') {
+        // Swift `for await x in seq`: the for_statement has a `try_operator`
+        // and/or `await` marker. The grammar varies; checking the raw text
+        // is the most robust signal here.
+        const headText = parent.text.split('{')[0] ?? '';
+        if (/\bawait\b/.test(headText)) {
+          flags.asyncIteration = true;
+        }
+        break; // don't keep walking up past a for loop
+      } else if (
+        // Stop at scope boundaries — we don't want call-site flags from
+        // an unrelated outer await/try.
+        parent.type === 'function_declaration' ||
+        parent.type === 'function_definition' ||
+        parent.type === 'method_definition' ||
+        parent.type === 'arrow_function' ||
+        parent.type === 'lambda_literal' ||
+        parent.type === 'closure_expression' ||
+        parent.type === 'class_body' ||
+        parent.type === 'class_declaration'
+      ) {
+        break;
+      }
+      parent = parent.parent;
+      depth++;
+    }
+
+    // Spawner / isolation-boundary detection by callee name.
+    const TASK_SPAWNERS = new Set([
+      'Task',
+      'Task.detached',
+      'Task.init',
+      'withTaskGroup',
+      'withThrowingTaskGroup',
+      'withDiscardingTaskGroup',
+      'withThrowingDiscardingTaskGroup',
+    ]);
+    const ISOLATION_BOUNDARIES = new Set([
+      'MainActor.run',
+      'assumeIsolated',
+      'withCheckedContinuation',
+      'withCheckedThrowingContinuation',
+      'withUnsafeContinuation',
+      'withUnsafeThrowingContinuation',
+    ]);
+    if (TASK_SPAWNERS.has(calleeName)) flags.spawnsTask = true;
+    if (ISOLATION_BOUNDARIES.has(calleeName)) flags.isolationBoundary = true;
+
+    return Object.keys(flags).length > 0 ? flags : undefined;
   }
 
   /**
@@ -1521,18 +1899,20 @@ export class TreeSitterExtractor {
    * (most non-decorator-using languages), the function is a no-op.
    */
   private extractDecoratorsFor(declNode: SyntaxNode, decoratedId: string): void {
+    // Node types that wrap a leading-`@` decoration across grammars:
+    //   `decorator`         — Python, TypeScript, etc.
+    //   `annotation`        — Kotlin, etc.
+    //   `marker_annotation` — Java (arg-less, e.g. `@Override`)
+    //   `attribute`         — Swift (`@MainActor`, `@objc`, `@Inject`, `@available(...)`),
+    //                         and any other grammar that uses this name
+    const isDecoratorNode = (n: SyntaxNode): boolean =>
+      n.type === 'decorator' ||
+      n.type === 'annotation' ||
+      n.type === 'marker_annotation' ||
+      n.type === 'attribute';
+
     const consider = (n: SyntaxNode | null): void => {
-      if (!n) return;
-      // `marker_annotation` is Java's grammar for arg-less annotations
-      // (`@Override`, `@Deprecated`); without including it, every
-      // such Java annotation would be silently skipped.
-      if (
-        n.type !== 'decorator' &&
-        n.type !== 'annotation' &&
-        n.type !== 'marker_annotation'
-      ) {
-        return;
-      }
+      if (!n || !isDecoratorNode(n)) return;
       // Find the leading identifier: skip the `@` punct, unwrap
       // a call_expression if the decorator is invoked with args.
       let target: SyntaxNode | null = null;
@@ -1546,6 +1926,9 @@ export class TreeSitterExtractor {
         }
         if (
           child.type === 'identifier' ||
+          child.type === 'simple_identifier' || // Swift / Kotlin
+          child.type === 'user_type' || // Swift attribute body
+          child.type === 'type_identifier' || // Swift / Rust
           child.type === 'member_expression' ||
           child.type === 'scoped_identifier' ||
           child.type === 'navigation_expression'
@@ -1571,7 +1954,17 @@ export class TreeSitterExtractor {
     // 1. Decorators that are direct children of the declaration
     //    (method/property style, also some grammars for class).
     for (let i = 0; i < declNode.namedChildCount; i++) {
-      consider(declNode.namedChild(i));
+      const direct = declNode.namedChild(i);
+      consider(direct);
+      // Tree-sitter-swift nests `attribute` nodes inside the `modifiers`
+      // child rather than as direct siblings. Walk one level deeper so
+      // `@MainActor`, `@Inject`, `@objc`, `@available(...)` etc. all flow
+      // through the universal decorator handler.
+      if (direct && direct.type === 'modifiers') {
+        for (let j = 0; j < direct.namedChildCount; j++) {
+          consider(direct.namedChild(j));
+        }
+      }
     }
 
     // 2. Decorators that are PRECEDING siblings of the declaration
@@ -1601,7 +1994,7 @@ export class TreeSitterExtractor {
         for (let j = declIdx - 1; j >= 0; j--) {
           const sibling = parent.namedChild(j);
           if (!sibling) continue;
-          if (sibling.type !== 'decorator' && sibling.type !== 'annotation' && sibling.type !== 'marker_annotation') {
+          if (!isDecoratorNode(sibling)) {
             break; // non-decorator separator → stop consuming
           }
           consider(sibling);

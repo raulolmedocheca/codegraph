@@ -26,6 +26,12 @@ export interface UnresolvedRef {
   language: Language;
   /** Possible qualified names it might resolve to */
   candidates?: string[];
+  /**
+   * Optional metadata to attach to the resulting Edge.
+   * Used to propagate call-site flags such as `isAwait`, `tryKind`,
+   * `spawnsTask`, `isolationBoundary` (see `Edge.metadata` docs).
+   */
+  metadata?: Record<string, unknown>;
 }
 
 /**

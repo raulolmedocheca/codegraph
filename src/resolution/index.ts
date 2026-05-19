@@ -91,6 +91,116 @@ const PASCAL_UNIT_PREFIXES = [
   'IdHTTP', 'IdTCP', 'IdSSL',
 ];
 
+/**
+ * Swift built-in TYPES (not protocols). Protocols like `Sendable` / `Hashable`
+ * intentionally NOT in this set — they have synthetic nodes registered by
+ * `ensureSwiftBuiltins`, so the resolver finds them and emits real edges.
+ *
+ * Types here include the value-type primitives (`Int`, `String`, …) and
+ * the most common stdlib generic types (`Array`, `Optional`, …). References
+ * to them get short-circuited as external to avoid wasted resolver work.
+ */
+const SWIFT_BUILTIN_TYPES = new Set([
+  // Numeric primitives
+  'Int', 'Int8', 'Int16', 'Int32', 'Int64',
+  'UInt', 'UInt8', 'UInt16', 'UInt32', 'UInt64',
+  'Float', 'Double', 'Float16', 'Float32', 'Float64',
+  'CGFloat',
+  // Boolean / strings / characters
+  'Bool', 'String', 'Substring', 'Character', 'StaticString', 'Unicode',
+  // Collections / containers
+  'Array', 'Dictionary', 'Set', 'ContiguousArray', 'ArraySlice',
+  'Optional', 'Result',
+  'Range', 'ClosedRange', 'PartialRangeFrom', 'PartialRangeUpTo', 'PartialRangeThrough',
+  'KeyPath', 'WritableKeyPath', 'ReferenceWritableKeyPath',
+  'AnyKeyPath', 'PartialKeyPath',
+  // Pointers / unsafe
+  'UnsafePointer', 'UnsafeMutablePointer', 'UnsafeRawPointer', 'UnsafeMutableRawPointer',
+  'UnsafeBufferPointer', 'UnsafeMutableBufferPointer',
+  'AutoreleasingUnsafeMutablePointer', 'OpaquePointer',
+  // Misc
+  'Void', 'Never', 'Any', 'AnyClass', 'Self', 'Type',
+  'ObjectIdentifier', 'AnyHashable',
+  // Concurrency types (the runtime types, not the protocols)
+  'Task', 'TaskGroup', 'ThrowingTaskGroup', 'CheckedContinuation', 'UnsafeContinuation',
+  'TaskPriority', 'TaskLocal', 'AsyncStream', 'AsyncThrowingStream',
+  // Bridged
+  'NSString', 'NSNumber', 'NSArray', 'NSDictionary', 'NSObject', 'NSError',
+  'CGRect', 'CGSize', 'CGPoint', 'NSRange',
+  // Swift literals
+  'nil', 'true', 'false',
+]);
+
+/**
+ * Swift modules (Foundation, UIKit, SwiftUI, …) — appear as `imports`
+ * references that can never resolve to a node in user code.
+ */
+const SWIFT_BUILTIN_MODULES = new Set([
+  'Swift',
+  'Foundation',
+  'Dispatch',
+  'Combine',
+  'CoreFoundation',
+  'CoreGraphics',
+  'CoreData',
+  'CoreLocation',
+  'CoreImage',
+  'CoreText',
+  'CoreServices',
+  'QuartzCore',
+  'OSLog',
+  'os',
+  'os.log',
+  'Security',
+  'CFNetwork',
+  'CryptoKit',
+  'Compression',
+  'UniformTypeIdentifiers',
+  'AVFoundation',
+  'AVKit',
+  'MediaPlayer',
+  'PhotosUI',
+  'Photos',
+  'Contacts',
+  'EventKit',
+  // UI frameworks
+  'UIKit', 'AppKit', 'WatchKit', 'WidgetKit', 'SwiftUI',
+  'CoreAnimation', 'UserNotifications',
+  // Swift Testing / XCTest
+  'XCTest', 'Testing',
+  // Concurrency
+  '_Concurrency',
+  // Networking / web
+  'Network', 'WebKit',
+  // Maps & location
+  'MapKit',
+  // ML / AR
+  'CoreML', 'Vision', 'ARKit', 'RealityKit',
+  // Combine adjacent
+  'Observation',
+]);
+
+/**
+ * Custom-attribute names that are known property wrappers / language
+ * attributes commonly used in Swift codebases — when the resolver sees a
+ * `decorates`/`wrapped_by` reference to one of these and there's no
+ * matching user-defined wrapper in the indexed code, we leave it
+ * unresolved rather than re-attempting expensive lookups.
+ *
+ * Note: we DON'T mark these as "external" outright because user code
+ * frequently defines `Inject`, `LazyInject`, etc. as property wrappers
+ * — and when it does, we want the wrapped_by edges to resolve to those
+ * definitions. This set is only consulted as a tiebreaker fallback.
+ */
+const SWIFT_COMMON_DI_WRAPPERS = new Set([
+  // Swinject / Resolver-style DI markers used in user code
+  'Inject', 'LazyInject', 'Injected', 'LazyInjected', 'WeakLazyInjected',
+  // SwiftUI built-in wrappers (covered separately too)
+  'State', 'Binding', 'StateObject', 'ObservedObject', 'EnvironmentObject',
+  'Environment', 'Published', 'AppStorage', 'SceneStorage',
+  'FocusState', 'Namespace', 'GestureState',
+]);
+
 const PASCAL_BUILT_INS = new Set([
   'System', 'SysUtils', 'Classes', 'Types', 'Variants', 'StrUtils',
   'Math', 'DateUtils', 'IOUtils', 'Generics.Collections', 'Generics.Defaults',
@@ -110,6 +220,30 @@ const PASCAL_BUILT_INS = new Set([
   'Exception', 'EAbort', 'EConvertError', 'EAccessViolation',
   'IInterface', 'IUnknown',
 ]);
+
+/**
+ * Categorise a Swift-style attribute / property-wrapper name into a
+ * coarse bucket the agent can filter by. Returns `undefined` when the
+ * name is unknown — the resulting edge then carries no category tag.
+ */
+function categoriseAttribute(name: string): 'isolation' | 'di' | 'swiftui' | 'objc' | 'availability' | undefined {
+  const SWIFTUI_WRAPPERS = new Set([
+    'State', 'Binding', 'StateObject', 'ObservedObject', 'EnvironmentObject',
+    'Environment', 'Published', 'AppStorage', 'SceneStorage',
+    'FocusState', 'Namespace', 'GestureState', 'ViewBuilder',
+  ]);
+  if (name === 'MainActor' || name === 'preconcurrency') return 'isolation';
+  if (SWIFT_COMMON_DI_WRAPPERS.has(name)) {
+    // Among DI markers, SwiftUI wrappers route to 'swiftui' for clarity.
+    return SWIFTUI_WRAPPERS.has(name) ? 'swiftui' : 'di';
+  }
+  if (name === 'objc' || name === 'objcMembers' || name === 'IBOutlet' ||
+      name === 'IBAction' || name === 'IBDesignable' || name === 'IBInspectable') {
+    return 'objc';
+  }
+  if (name === 'available' || name === 'unavailable') return 'availability';
+  return undefined;
+}
 
 /**
  * Reference Resolver
@@ -501,29 +635,74 @@ export class ReferenceResolver {
   createEdges(resolved: ResolvedRef[]): Edge[] {
     return resolved.map((ref) => {
       let kind = ref.original.referenceKind;
+      const isSwift = ref.original.language === 'swift';
 
-      // Promote "extends" to "implements" when a class/struct targets an interface
+      // Promote `extends` based on target kind:
+      //
+      //  Swift specifically:
+      //    target protocol  → `conforms_to`
+      //    target class     → `inherits_from`
+      //    target actor     → `inherits_from` (rare but valid)
+      //
+      //  Other languages keep the historic behaviour:
+      //    target interface → `implements` (JVM convention)
+      //    target protocol  → `implements` (preserve prior semantics)
+      //
+      // This lets Swift surface protocol conformance and class inheritance
+      // as distinct, queryable edges without disturbing JVM-language flows.
       if (kind === 'extends') {
         const targetNode = this.queries.getNodeById(ref.targetNodeId);
-        if (targetNode && (targetNode.kind === 'interface' || targetNode.kind === 'protocol')) {
-          const sourceNode = this.queries.getNodeById(ref.original.fromNodeId);
-          if (sourceNode && sourceNode.kind !== 'interface' && sourceNode.kind !== 'protocol') {
-            kind = 'implements';
+        if (targetNode) {
+          if (isSwift) {
+            if (targetNode.kind === 'protocol') {
+              kind = 'conforms_to';
+            } else if (targetNode.kind === 'class' || targetNode.kind === 'actor') {
+              kind = 'inherits_from';
+            }
+          } else if (targetNode.kind === 'interface' || targetNode.kind === 'protocol') {
+            const sourceNode = this.queries.getNodeById(ref.original.fromNodeId);
+            if (sourceNode && sourceNode.kind !== 'interface' && sourceNode.kind !== 'protocol') {
+              kind = 'implements';
+            }
           }
         }
       }
 
       // Promote "calls" to "instantiates" when the resolved target is a
-      // class/struct. Languages without a `new` keyword (Python, Ruby)
-      // express instantiation as `Foo()` — extraction can't tell that
-      // apart from a function call without symbol info, but resolution
-      // can: if `Foo` resolves to a class, the call IS an instantiation.
+      // class/struct. Languages without a `new` keyword (Python, Ruby,
+      // Swift) express instantiation as `Foo()` — extraction can't tell
+      // that apart from a function call without symbol info, but
+      // resolution can: if `Foo` resolves to a class, the call IS an
+      // instantiation. (Swift actors are also constructed with `Foo()`.)
       if (kind === 'calls') {
         const targetNode = this.queries.getNodeById(ref.targetNodeId);
-        if (targetNode && (targetNode.kind === 'class' || targetNode.kind === 'struct')) {
+        if (
+          targetNode &&
+          (targetNode.kind === 'class' ||
+            targetNode.kind === 'struct' ||
+            targetNode.kind === 'actor')
+        ) {
           kind = 'instantiates';
         }
       }
+
+      // Categorise `decorates` edges so the agent can quickly filter
+      // "isolation attributes" vs "dependency-injection wrappers" vs
+      // "SwiftUI state wrappers". Cheap — no extra DB lookup.
+      let categoryMeta: Record<string, string> | undefined;
+      if (kind === 'decorates' || kind === 'wrapped_by') {
+        const cat = categoriseAttribute(ref.original.referenceName);
+        if (cat) categoryMeta = { category: cat };
+      }
+
+      // Preserve any call-site / inheritance metadata propagated by the
+      // language extractor (e.g. `isAwait`, `tryKind`, `spawnsTask`).
+      const metadata: Record<string, unknown> = {
+        ...(ref.original.metadata ?? {}),
+        ...(categoryMeta ?? {}),
+        confidence: ref.confidence,
+        resolvedBy: ref.resolvedBy,
+      };
 
       return {
         source: ref.original.fromNodeId,
@@ -531,10 +710,7 @@ export class ReferenceResolver {
         kind,
         line: ref.original.line,
         column: ref.original.column,
-        metadata: {
-          confidence: ref.confidence,
-          resolvedBy: ref.resolvedBy,
-        },
+        metadata,
       };
     });
   }
@@ -735,6 +911,39 @@ export class ReferenceResolver {
       }
       if (PASCAL_BUILT_INS.has(name)) {
         return true;
+      }
+    }
+
+    // Swift built-in types and modules.
+    // Stdlib PROTOCOLS (Sendable, Hashable, Codable, …) intentionally NOT
+    // listed here — they have synthetic nodes registered via
+    // `ensureSwiftBuiltins`, so we WANT the resolver to find them and
+    // emit `conforms_to` edges instead of marking them external.
+    if (ref.language === 'swift') {
+      if (SWIFT_BUILTIN_TYPES.has(name)) {
+        return true;
+      }
+      // Imports: `import Foundation`, `import UIKit`. The reference name
+      // is the module path; `Foo.Bar` granular imports are also handled.
+      if (ref.referenceKind === 'imports') {
+        const root = name.split('.')[0];
+        if (root && SWIFT_BUILTIN_MODULES.has(root)) {
+          return true;
+        }
+      }
+      // Member accesses on built-in types (`Int.max`, `String.UTF8View`,
+      // `Optional.none`). Receiver-only check so a user-defined extension
+      // on `Int` (`extension Int { var displayName: ... }`) still resolves.
+      const dotIdx = name.indexOf('.');
+      if (dotIdx > 0) {
+        const receiver = name.substring(0, dotIdx);
+        if (SWIFT_BUILTIN_TYPES.has(receiver)) {
+          // Don't short-circuit when the user has a node by that name —
+          // they may have extended the type.
+          if (!this.knownNames?.has(name)) {
+            return true;
+          }
+        }
       }
     }
 

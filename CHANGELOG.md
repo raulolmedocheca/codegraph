@@ -7,6 +7,69 @@ a [GitHub Release](https://github.com/colbymchenry/codegraph/releases) tagged
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.9-webel.1] — Webel Fork — Swift Concurrency Support
+
+Private fork of upstream `0.7.9` adding full Swift concurrency and architecture
+visibility for the Webel-iOS codebase (actors, `@MainActor`, `Sendable`,
+property wrappers, typed throws, await/try call sites, …). Backward-compatible
+with the upstream MCP API; non-Swift languages see no behaviour change.
+
+### Added
+
+- **New `NodeKind`s**: `actor`, `extension`, `initializer`, `deinitializer`,
+  `subscript`, `operator`.
+- **New `EdgeKind`s**: `conforms_to`, `inherits_from`, `wrapped_by`,
+  `isolated_to`.
+- **New `Node` fields**: `modifiers`, `isActor`, `isOverride`, `isFinal`,
+  `isThrowing`, `isRethrowing`, `thrownType`, `isSendable`,
+  `isSendableUnchecked`, `isolation` (`{ kind, actor? }`), `conformsTo`,
+  `inheritsFrom`, `propertyWrappers`, `whereClause`.
+- **Call-site metadata** on `calls` edges: `isAwait`, `tryKind`
+  (`plain | optional | forced`), `spawnsTask`, `asyncIteration`,
+  `isolationBoundary`.
+- **Synthetic Swift stdlib nodes** (`Sendable`, `Hashable`, `Codable`,
+  `Identifiable`, `Error`, `AsyncSequence`, …) registered on DB init so
+  conformances resolve to real targets.
+- **MCP surfacing**: `formatNodeDetails` shows isolation, sendable, throws,
+  modifiers, wrappers, conformances, attributes; `formatNodeList` adds
+  compact tags (`[@MainActor]`, `[Sendable]`, `[throws]`, `[@Inject]`);
+  `formatImpact` summarises concurrency context.
+- **Server-instructions Swift section**: explains the model and gives 5
+  concrete tool-selection patterns for concurrency / DI queries.
+- **24 new tests** in `swift-concurrency.test.ts` covering the full
+  feature matrix.
+
+### Changed
+
+- `LanguageExtractor` gains 9 optional hooks: `getModifiers`, `getIsolation`,
+  `isThrowing`, `isRethrowing`, `getThrownType`, `isOverride`, `isFinal`,
+  `getPropertyWrappers`, `getInheritanceClause`. `classifyClassNode` return
+  type widened with `'actor'` and `'extension'`.
+- `extractDecoratorsFor` now recognises tree-sitter's `attribute` node type
+  (Swift). The matched attribute is searched both as a direct child and
+  inside the `modifiers` wrapper.
+- `extractInheritance` already supported Swift's `inheritance_specifier`;
+  the resolver now promotes `extends` to `conforms_to` (target = protocol)
+  or `inherits_from` (target = class/actor) on Swift sources, leaving JVM
+  languages on the historic `implements` promotion.
+- DB schema v5: 8 new indexable boolean / kind columns on `nodes` plus a
+  `metadata_json` blob; `unresolved_refs.metadata` for propagating
+  call-site flags.
+- Swift extractor (`src/extraction/languages/swift.ts`) fully rewritten
+  (83 → 651 lines) with the new hooks, robust attribute-name extraction
+  (regex against raw text), `isAsync` / `isThrowing` walking all children
+  (not just named) since tree-sitter-swift emits these keywords as
+  unnamed terminals.
+
+### Known limitations (tree-sitter-swift grammar)
+
+- `nonisolated(unsafe)` is parsed as a syntax `ERROR`; the
+  `nonisolated_unsafe` isolation kind is unreachable until the grammar
+  ships support.
+- Swift 6 typed throws `throws(SomeError)` parses as `ERROR +
+  call_expression`; the `thrownType` field is plumbed through but won't
+  be populated for typed throws until the grammar lands.
+
 ## [0.7.8] - 2026-05-17
 
 ### Fixed

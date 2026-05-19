@@ -917,7 +917,9 @@ public protocol Repository {
 `;
     const result = extractFromSource('Repository.swift', code);
 
-    const protocolNode = result.nodes.find((n) => n.kind === 'interface');
+    // Swift protocols now get their proper `kind: 'protocol'` (was 'interface'
+    // in the legacy extractor; the new extractor sets interfaceKind = 'protocol').
+    const protocolNode = result.nodes.find((n) => n.kind === 'protocol');
     expect(protocolNode).toBeDefined();
     expect(protocolNode?.name).toBe('Repository');
   });

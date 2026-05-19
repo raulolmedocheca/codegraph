@@ -152,9 +152,13 @@ export interface LanguageExtractor {
 
   /**
    * Classify a class_declaration node when the grammar reuses one node type
-   * for multiple concepts (e.g. Swift uses class_declaration for classes, structs, and enums).
+   * for multiple concepts (e.g. Swift uses class_declaration for classes,
+   * structs, enums, actors, and extensions, all under the same AST node type
+   * but discriminated by a `declaration_kind` field).
    */
-  classifyClassNode?: (node: SyntaxNode) => 'class' | 'struct' | 'enum' | 'interface' | 'trait';
+  classifyClassNode?: (
+    node: SyntaxNode
+  ) => 'class' | 'struct' | 'enum' | 'interface' | 'trait' | 'actor' | 'extension';
 
   /**
    * Resolve the body node for a function/method/class when it's not a child field.
@@ -206,4 +210,69 @@ export interface LanguageExtractor {
    * Returns the callee name if this node is a bare call, or undefined if not.
    */
   extractBareCall?: (node: SyntaxNode, source: string) => string | undefined;
+
+  // ---------------------------------------------------------------------------
+  // Modern-language metadata hooks (Swift concurrency / DI, transferable to
+  // any language with similar constructs). All optional and additive — the
+  // core extractor calls each one and falls back to `undefined` if absent.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Raw modifier keywords on the declaration.
+   * Swift examples: `final`, `open`, `override`, `convenience`, `required`,
+   * `lazy`, `weak`, `unowned`, `unowned(unsafe)`, `dynamic`, `distributed`,
+   * `indirect`, `nonisolated`, `nonisolated(unsafe)`, `borrowing`, `consuming`,
+   * `inout`, `mutating`, `nonmutating`.
+   * Stored verbatim on `Node.modifiers`.
+   */
+  getModifiers?: (node: SyntaxNode, source: string) => string[];
+
+  /**
+   * Actor / global-actor isolation context for this declaration.
+   * Mirrors `Node.isolation`. Return `undefined` if the symbol carries no
+   * explicit isolation annotation (the resolver may still infer it from
+   * the enclosing actor/global actor at query time).
+   */
+  getIsolation?: (node: SyntaxNode, source: string) => Node['isolation'];
+
+  /** True if a function/method/initializer is declared `throws`. */
+  isThrowing?: (node: SyntaxNode) => boolean;
+
+  /** True if a function/method is declared `rethrows` (Swift). */
+  isRethrowing?: (node: SyntaxNode) => boolean;
+
+  /**
+   * Typed-throws error type (Swift 6: `throws(SomeError)`).
+   * Return `undefined` for untyped `throws` / `rethrows`.
+   */
+  getThrownType?: (node: SyntaxNode, source: string) => string | undefined;
+
+  /** True if the declaration carries `override` (Swift, Kotlin, C#). */
+  isOverride?: (node: SyntaxNode) => boolean;
+
+  /** True if the declaration carries `final` (Swift, Kotlin, Scala). */
+  isFinal?: (node: SyntaxNode) => boolean;
+
+  /**
+   * Property wrappers applied to a property declaration. Returned names
+   * are written WITHOUT the leading `@` (e.g. `["Inject", "MainActor"]`).
+   * Stored on `Node.propertyWrappers`; the core also emits `wrapped_by`
+   * edges from the property to each wrapper.
+   */
+  getPropertyWrappers?: (node: SyntaxNode, source: string) => string[];
+
+  /**
+   * Extract the inheritance / conformance clause of a type declaration.
+   * - `inherits`: heuristic superclass name (Swift class inheritance).
+   *   Resolver may demote to a `conforms_to` edge if the resolved target
+   *   turns out to be a protocol.
+   * - `conforms`: every other type referenced in the inheritance clause.
+   * - `whereClause`: raw text of the `where` clause if present.
+   *
+   * Return `undefined` when the node has no inheritance clause.
+   */
+  getInheritanceClause?: (
+    node: SyntaxNode,
+    source: string
+  ) => { inherits?: string; conforms: string[]; whereClause?: string } | undefined;
 }
